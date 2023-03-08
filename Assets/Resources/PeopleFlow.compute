@@ -1,0 +1,116 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel FlowUpdate
+#pragma kernel DepthUpdate
+
+
+float _TickTime;
+uint _Size;
+float _Length;
+StructuredBuffer<float4> _Prev; // NOT_USED, depth, velX, velY
+RWStructuredBuffer<float4> _Next;
+
+
+uint Index(uint2 id)
+{
+	return id.x * _Size + id.y;
+}
+
+uint Index(uint x, uint y)
+{
+	return x * _Size + y;
+}
+
+float Height(uint index)
+{
+	return _Prev[index].x + _Prev[index].y;
+}
+
+float GetUpwindDepth(uint index1, uint index2)
+{
+	if (_Prev[index1].x + _Prev[index1].y > _Prev[index2].x + _Prev[index2].y)
+		return _Prev[index1].y;
+	else
+		return _Prev[index2].y;
+}
+
+float GetUpwindDepth(float depth1, float depth2, float deltaHeight) // deltaHeight = Height1 - Height2
+{
+	if (deltaHeight > 0)
+		return depth1;
+	else // When deltaHeight is 0, flow won't change anyways
+		return depth2;
+}
+
+
+
+[numthreads(8, 8, 1)]
+void FlowUpdate(uint3 id : SV_DispatchThreadID)
+{
+	float flowX = CalcNewFlowX(id.xy);
+	float flowZ = CalcNewFlowZ(id.xy);
+
+	uint i = Index(id.xy);
+
+	// Limiting step:
+	// Only update flows for OUT flows, (since there are 2 positions referring to each pipe) so that it can be multithreaded
+	float totalOutFlow = 0;
+
+	// id.x will wrap to uint's max value if id.x is 0, and thus will return 0 in that case
+	uint2 lowX = uint2(id.x - 1, id.y);
+	uint2 lowZ = uint2(id.x, id.y - 1);
+	float flowXLow = CalcNewFlowX(lowX);
+	float flowZLow = CalcNewFlowZ(lowZ);
+	if (flowXLow < 0)
+		totalOutFlow -= flowXLow;
+	if (flowZLow < 0)
+		totalOutFlow -= flowZLow;
+	if (flowX >= 0)
+		totalOutFlow += flowX;
+	if (flowZ >= 0)
+		totalOutFlow += flowZ;
+
+	totalOutFlow *= _TickTime / (_Length * _Length);
+
+	float scale;
+	if (_Prev[i].y < totalOutFlow) // Depth is about to become negative
+		scale = 0.999999f * _Prev[i].y / totalOutFlow;
+	else
+		scale = 1;
+
+
+	if (flowXLow < 0)
+		_Next[Index(lowX)].z = flowXLow * scale;
+	if (flowZLow < 0)
+		_Next[Index(lowZ)].w = flowZLow * scale;
+	if (flowX >= 0)
+		_Next[i].z = flowX * scale;
+	if (flowZ >= 0)
+		_Next[i].w = flowZ * scale;
+
+	_Next[i].xy = _Prev[i].xy; // Copy these values over...
+}
+
+[numthreads(8, 8, 1)]
+void DepthUpdate(uint3 id : SV_DispatchThreadID)
+{
+	float nextDepth;
+	uint i = Index(id.xy);
+	if (id.x == 0 || id.y == 0 || id.x == _Size - 1 || id.y == _Size - 1)
+	{
+		nextDepth = 0;
+	}
+	else
+	{
+		nextDepth = _Prev[i].y + _TickTime * (_Prev[Index(id.x - 1, id.y)].z + _Prev[Index(id.x, id.y - 1)].w - _Prev[i].z - _Prev[i].w) / (_Length * _Length);
+	}
+	_Next[i] = float4(_Prev[i].x, nextDepth, _Prev[i].z, _Prev[i].w);
+}
+
+
+
+
+
+
+
+
+

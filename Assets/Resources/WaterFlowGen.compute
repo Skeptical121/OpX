@@ -1,0 +1,422 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel FlowUpdate
+#pragma kernel DepthUpdate
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+// RWTexture2D<float4> Result;
+
+// Everything is a wall..
+//struct HeightField
+//{
+//	float x;
+//	float y;
+//	float z;
+//	float w;
+//};
+
+struct WaterTable
+{
+	float2x2 height; // this can be float height, and float ground instead..
+	float2 normalXZ;
+	float2 vel;
+	// Delay for waterfall to appear, delay for waterfall to disappear
+};
+
+//struct WaterFall
+//{
+//	float3 start;
+//	float2 dir;
+//};
+
+
+float _TickTime;
+float _StabilityMultiplier; // X^TickTime 
+uint _Size;
+float _OceanHeight;
+float _Length;
+static const float _Gravity = 9.8f;
+static const float _WaterDecrease = 0.1f;
+static const float _MaxWaterHeightChangePerSecond = 50.0f;
+StructuredBuffer<float4> _Prev;
+RWStructuredBuffer<float4> _Next;
+
+
+// Because of the way we are rendering water, (with the vertices offset, and walls)
+// This calculation can actually be done in the depth kernel...
+
+// depth and height stored 4 times, velX, velZ are only stored once
+
+RWStructuredBuffer<WaterTable> _OutBuffer; // ground, depth, velX, velZ, for the 4 nearby vertices.. which is equivalent to doubling the map size in terms of memory
+// AppendStructuredBuffer<WaterFall> _OutWaterFalls;
+
+// x = ground
+// y = depth
+// z = Flow X in positive direction
+// w = Flow Z in positive direction
+
+uint Index(uint2 id)
+{
+	return id.x * _Size + id.y;
+}
+
+uint Index(uint x, uint y)
+{
+	return x * _Size + y;
+}
+
+float Height(uint index)
+{
+	return _Prev[index].x + _Prev[index].y;
+}
+
+float GetUpwindDepth(uint index1, uint index2)
+{
+	float maxGround = max(_Prev[index1].x, _Prev[index2].x);
+	if (_Prev[index1].x + _Prev[index1].y > _Prev[index2].x + _Prev[index2].y)
+		return _Prev[index1].x + _Prev[index1].y - maxGround; // Instead of returning depth, return upwind height minus maxGround
+	else
+		return _Prev[index2].x + _Prev[index2].y - maxGround;
+}
+
+/*float GetUpwindDepth(float depth1, float depth2, float deltaHeight) // deltaHeight = Height1 - Height2
+{
+	if (deltaHeight > 0)
+		return depth1;
+	else // When deltaHeight is 0, flow won't change anyways
+		return depth2;
+}*/
+
+
+
+
+
+
+
+
+
+float VelocityX(uint2 id)
+{
+	float upwindDepth = GetUpwindDepth(Index(id), Index(id.x + 1, id.y));
+	// if (upwindDepth < 0.01f)
+	// 	return 0;
+	// else
+		return _Prev[Index(id)].z / (_Length * max(1, upwindDepth));
+}
+
+float VelocityZ(uint2 id)
+{
+	float upwindDepth = GetUpwindDepth(Index(id), Index(id.x, id.y + 1));
+	// if (upwindDepth < 0.01f)
+	// 	return 0;
+	// else
+		return _Prev[Index(id)].w / (_Length * max(1, upwindDepth));
+}
+
+float2 CalcNormal(float2 sideHeightSum[2], float2 sideCount[2])
+{
+	float2 normal = float2(0, 0);
+	if (sideCount[0].x > 0 && sideCount[1].x > 0)
+		normal.x = sideHeightSum[1].x / sideCount[1].x - sideHeightSum[0].x / sideCount[0].x;
+
+	if (sideCount[0].y > 0 && sideCount[1].y > 0)
+		normal.y = sideHeightSum[1].y / sideCount[1].y - sideHeightSum[0].y / sideCount[0].y;
+	return normal;
+}
+
+float2 AverageHeight(float x, float z, bool calcNormal, out float2 groundAndHeight)
+{
+	float2 maxGround = 0;
+
+	float groundSum = 0;
+	float heightSum = 0;
+	float2 sideHeightSum[2];
+	sideHeightSum[0] = 0;
+	sideHeightSum[1] = 0;
+	float2 sideCount[2];
+	sideCount[0] = 0;
+	sideCount[1] = 0;
+	int count = 0;
+	float4 data[4];
+	for (uint x2 = max(0, x - 1); x2 <= x && x2 < _Size; x2++)
+	{
+		uint xVal = x2 - max(0, x - 1);
+		for (uint z2 = max(0, z - 1); z2 <= z && z2 < _Size; z2++)
+		{
+			float height = Height(Index(x2, z2));
+
+			uint zVal = z2 - max(0, z - 1);
+			sideHeightSum[xVal].x += height;
+			sideHeightSum[zVal].y += height;
+			sideCount[xVal].x++;
+			sideCount[zVal].y++;
+
+			data[count] = float4(_Prev[Index(x2, z2)].x, height, xVal, zVal);
+			groundSum += data[count].x;
+			heightSum += data[count].y;
+			if (data[count].x > maxGround.x && _Prev[Index(x2, z2)].y >= _WaterDecrease)
+				maxGround = float2(data[count].x, _Prev[Index(x2, z2)].y);
+			count++;
+
+		}
+	}
+
+	while (count > 1)
+	{
+		int k = 0;
+		for (int i = 1; i < count; i++)
+		{
+			if (data[i].x > data[k].x)
+			{
+				k = i;
+			}
+		}
+		if (heightSum / count >= data[k].x)
+		{
+			break;
+		}
+		else
+		{
+			// Shift data over:
+			count--;
+			groundSum -= data[k].x;
+			heightSum -= data[k].y;
+			sideHeightSum[data[k].z].x -= data[k].y;
+			sideHeightSum[data[k].w].y -= data[k].y;
+			sideCount[data[k].z].x--;
+			sideCount[data[k].w].y--;
+			for (int i = k; i < count; i++)
+			{
+				data[i] = data[i + 1];
+			}
+		}
+	}
+	groundAndHeight = float2(groundSum / count, heightSum / count);
+	if (maxGround.x > groundAndHeight.y)
+	{
+		groundAndHeight.y = maxGround.x + maxGround.y;// _WaterDecrease; // maxGround.y;
+	}
+	if (calcNormal)
+		return CalcNormal(sideHeightSum, sideCount);
+	return 0;
+}
+
+
+
+void OutUpdate(uint3 id)
+{
+
+	WaterTable outTable;
+	// float2x2 prev = _PrevWaterTable[Index(id.xy)].height;
+	float maxChange = _MaxWaterHeightChangePerSecond * _TickTime;
+
+	float ground = _Prev[Index(id.xy)].x;
+
+	float2 groundAndHeight;
+	outTable.normalXZ = AverageHeight(id.x + 0, id.y + 0, true, groundAndHeight); // It doesn't matter what the normal is if there is no water...
+	outTable.height[0][0] = /*clamp(*/max(ground, groundAndHeight.y) - _WaterDecrease;//, prev[0][0] - maxChange, prev[0][0] + maxChange);
+
+	AverageHeight(id.x + 0, id.y + 1, false, groundAndHeight); // It doesn't matter what the normal is if there is no water...
+	outTable.height[0][1] = /*clamp(*/max(ground, groundAndHeight.y) - _WaterDecrease;//, prev[0][1] - maxChange, prev[0][1] + maxChange);
+
+	AverageHeight(id.x + 1, id.y + 0, false, groundAndHeight); // It doesn't matter what the normal is if there is no water...
+	outTable.height[1][0] = /*clamp(*/max(ground, groundAndHeight.y) - _WaterDecrease;//, prev[1][0] - maxChange, prev[1][0] + maxChange);
+
+	AverageHeight(id.x + 1, id.y + 1, false, groundAndHeight); // It doesn't matter what the normal is if there is no water...
+	outTable.height[1][1] = /*clamp(*/max(ground, groundAndHeight.y) - _WaterDecrease;//, prev[1][1] - maxChange, prev[1][1] + maxChange);
+
+	/*for (uint x = 0; x < 2; x++)
+	{
+		for (uint z = 0; z < 2; z++)
+		{
+			if (x == 0 && z == 0)
+			{
+			}
+			else
+			{
+				AverageHeight(id.x + x, id.y + z, false, groundAndHeight);
+			}
+			groundAndHeight.y = max(ground, groundAndHeight.y) - 0.2f; // Height has to be at least ground for this coordinate
+
+			// if (x == 0 && z == 0)
+			//	outTable.avgDepth = groundAndHeight.y - groundAndHeight.x;
+
+			// This forces the loop to unroll:
+			outTable.height[x][z] = groundAndHeight.y;
+		}
+	}*/
+	outTable.vel = float2(VelocityX(id.xy), VelocityZ(id.xy));
+	_OutBuffer[Index(id.xy)] = outTable;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+float CalcNewFlowX(uint2 id)
+{
+	if (id.x + 1 < _Size)
+	{
+		float deltaHeight = Height(Index(id)) - Height(Index(id.x + 1, id.y)); // If my height is higher, flow to you
+		float upwindDepth = GetUpwindDepth(Index(id), Index(id.x + 1, id.y)); // GetUpwindDepth(_Prev[Index(id)].y, _Prev[Index(id.x + 1, id.y)].y, deltaHeight);
+		return (_Prev[Index(id)].z + upwindDepth * _Length * (_Gravity / _Length) * deltaHeight * _TickTime) * _StabilityMultiplier;
+	}
+	return 0;
+}
+
+float CalcNewFlowZ(uint2 id)
+{
+	if (id.y + 1 < _Size)
+	{
+		float deltaHeight = Height(Index(id)) - Height(Index(id.x, id.y + 1)); // If my height is higher, flow to you
+		float upwindDepth = GetUpwindDepth(Index(id), Index(id.x, id.y + 1)); // GetUpwindDepth(_Prev[Index(id)].y, _Prev[Index(id.x, id.y + 1)].y, deltaHeight);
+		return (_Prev[Index(id)].w + upwindDepth * _Length * (_Gravity / _Length) * deltaHeight * _TickTime) * _StabilityMultiplier;
+	}
+	return 0;
+}
+
+[numthreads(8,8,1)]
+void FlowUpdate(uint3 id : SV_DispatchThreadID)
+{
+    // Result[id.xy] = float4(id.x & id.y, (id.x & 15)/15.0, (id.y & 15)/15.0, 0.0);
+	float flowX = CalcNewFlowX(id.xy);
+	float flowZ = CalcNewFlowZ(id.xy);
+
+	uint i = Index(id.xy);
+
+	// Limiting step:
+	// Only update flows for OUT flows, (since there are 2 positions referring to each pipe) so that it can be multithreaded
+	float totalOutFlow = 0;
+
+	// id.x will wrap to uint's max value if id.x is 0, and thus will return 0 in that case
+	uint2 lowX = uint2(id.x - 1, id.y);
+	uint2 lowZ = uint2(id.x, id.y - 1);
+	float flowXLow = CalcNewFlowX(lowX);
+	float flowZLow = CalcNewFlowZ(lowZ);
+	if (flowXLow < 0)
+		totalOutFlow -= flowXLow;
+	if (flowZLow < 0)
+		totalOutFlow -= flowZLow;
+	if (flowX >= 0)
+		totalOutFlow += flowX;
+	if (flowZ >= 0)
+		totalOutFlow += flowZ;
+
+	totalOutFlow *= _TickTime / (_Length * _Length);
+
+	float scale;
+	if (_Prev[i].y < totalOutFlow) // Depth is about to become negative
+		scale = 0.999999f * _Prev[i].y / totalOutFlow;
+	else
+		scale = 1;
+
+
+	if (flowXLow < 0)
+		_Next[Index(lowX)].z = flowXLow * scale;
+	if (flowZLow < 0)
+		_Next[Index(lowZ)].w = flowZLow * scale;
+	if (flowX >= 0)
+		_Next[i].z = flowX * scale;
+	if (flowZ >= 0)
+		_Next[i].w = flowZ * scale;
+
+	_Next[i].xy = _Prev[i].xy; // Copy these values over...
+	// Next[Index(id.xy)] = float4(Prev[Index(id.xy)].x, Prev[Index(id.xy)].y, flowX, flowZ);
+}
+/*
+void LimitingUpdate(uint3 id : SV_DispatchThreadID)
+{
+	float totalOutFlow = 0;
+
+	float flowX = Prev[Index(id.xy)].z;
+	float flowZ = Prev[Index(id.xy)].w;
+
+	// id.x will wrap to uint's max value if id.x is 0, and thus will return 0 in that case
+	uint lowX = Index(id.x - 1, id.y);
+	uint lowZ = Index(id.x, id.y - 1);
+	float flowXLow = Prev[lowX].z;
+	float flowZLow = Prev[lowZ].w;
+
+	if (flowXLow < 0)
+		totalOutFlow -= flowXLow;
+	if (flowZLow < 0)
+		totalOutFlow -= flowZLow;
+	if (flowX > 0)
+		totalOutFlow += flowX;
+	if (flowZ > 0)
+		totalOutFlow += flowZ;
+	if (Prev[Index(id.xy)].y < totalOutFlow)
+	{
+		// Depth is about to become negative:
+		float scale = Prev[Index(id.xy)].y / totalOutFlow;
+		if (flowXLow < 0)
+			Next[lowX] = float4(Prev[lowX].x, Prev[lowX].y, flowXLow * scale, Prev[lowX].w);
+		if (flowZLow < 0)
+			Next[lowZ] = float4(Prev[lowZ].x, Prev[lowZ].y, Prev[lowZ].z, flowZLow * scale);
+		if (flowX > 0)
+			flowX *= scale;
+		if (flowZ > 0)
+			flowZ *= scale;
+
+		Next[lowX].x = 5.f;
+	}
+}*/
+
+//float NewDepth(int index, int x, int z)
+//{
+//	float extra = (x == 0 ? 0 : flowX[Index(x - 1, z)]) + (z == 0 ? 0 : flowZ[Index(x, z - 1)]);
+//
+//	return depth[index] + tickTime * (flowX[index] + flowZ[index] - extra) / (LENGTH * LENGTH);
+//}
+
+[numthreads(8, 8, 1)]
+void DepthUpdate(uint3 id : SV_DispatchThreadID)
+{
+	float nextDepth;
+	uint i = Index(id.xy);
+	if (id.x == 0 || id.y == 0 || id.x == _Size - 1 || id.y == _Size - 1)
+	{
+		nextDepth = _OceanHeight - _Prev[i].x; // Assumes ground is below ocean height..
+	}
+	/*if (id.x == 0 && id.y == 0)
+	{
+		nextDepth = Prev[i].y + TickTime * (- Prev[i].z - Prev[i].w) / (Length * Length); 
+		// Conveniently, we don't have to worry about the edges because of this..
+	}
+	else if (id.x == 0)
+	{
+		nextDepth = Prev[i].y + TickTime * (Prev[Index(id.x, id.y - 1)].w - Prev[i].z - Prev[i].w) / (Length * Length);
+	}
+	else if (id.y == 0)
+	{
+		nextDepth = Prev[i].y + TickTime * (Prev[Index(id.x - 1, id.y)].z - Prev[i].z - Prev[i].w) / (Length * Length);
+	}*/
+	else
+	{
+		nextDepth = _Prev[i].y + _TickTime * (_Prev[Index(id.x - 1, id.y)].z + _Prev[Index(id.x, id.y - 1)].w - _Prev[i].z - _Prev[i].w) / (_Length * _Length);
+	}
+	_Next[i] = float4(_Prev[i].x, nextDepth, _Prev[i].z, _Prev[i].w);
+
+	// Result[id.xy] = float4(id.x & id.y, (id.x & 15) / 15.0, (id.y & 15) / 15.0, 0.0);
+
+	OutUpdate(id);
+}
+
+
+
+
+
+
+
+
+

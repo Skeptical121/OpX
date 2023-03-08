@@ -1,0 +1,293 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct Vert
+{
+	float4 position;
+	float3 normal;
+};
+
+// Just to be able to add the vertices in one go...
+struct Quad
+{
+	Vert a;
+	Vert b;
+	Vert c;
+	Vert d;
+	Vert e;
+	Vert f;
+};
+
+struct WaterTable
+{
+	float2x2 height; // this can be float height, and float ground instead..
+	float2 normalXZ;
+	float2 vel;
+};
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+float _NaN;
+uint _Size;
+float _Length;
+// StructuredBuffer<float4> Prev;
+
+// AppendStructuredBuffer<Vert> _VertBuffer;
+RWStructuredBuffer<Vert> _VertBuffer;
+RWStructuredBuffer<float2> _FlowMap;
+// RWTexture2D<float4> _FlowMap;
+
+float _DeltaTime;
+float _Interp;
+RWStructuredBuffer<WaterTable> _WaterTablePrev;
+RWStructuredBuffer<WaterTable> _WaterTableNext;
+
+
+
+// StructuredBuffer<int> Height;
+
+uint Index(uint2 id)
+{
+	return id.x * _Size + id.y;
+}
+
+uint Index(uint x, uint y)
+{
+	return x * _Size + y;
+}
+
+/*float Height(uint index)
+{
+	return Prev[index].x + Prev[index].y;
+}
+
+float GetUpwindDepth(uint index1, uint index2)
+{
+	if (Prev[index1].x + Prev[index1].y > Prev[index2].x + Prev[index2].y)
+		return Prev[index1].y;
+	else
+		return Prev[index2].y;
+}*/
+
+float VelocityX(uint2 id)
+{
+	return lerp(_WaterTablePrev[Index(id)].vel.x, _WaterTableNext[Index(id)].vel.x, _Interp); // Prev[Index(id)].z / (Length * GetUpwindDepth(Index(id), Index(id.x + 1, id.y)));
+}
+
+float VelocityZ(uint2 id)
+{
+	return lerp(_WaterTablePrev[Index(id)].vel.y, _WaterTableNext[Index(id)].vel.y, _Interp); // Prev[Index(id)].w / (Length * GetUpwindDepth(Index(id), Index(id.x, id.y + 1)));
+}
+
+/*float2 AverageHeight(float x, float z)
+{
+	float groundSum = 0;
+	float heightSum = 0;
+	int count = 0;
+	float2 data[4];
+	for (uint x2 = max(0, x - 1); x2 <= x && x2 < Size; x2++)
+	{
+		for (uint z2 = max(0, z - 1); z2 <= z && z2 < Size; z2++)
+		{
+			data[count] = float2(Prev[Index(x2, z2)].x, Height(Index(x2, z2)));
+			groundSum += data[count].x;
+			heightSum += data[count].y;
+			count++;
+		}
+	}
+	while (count > 1)
+	{
+		int k = 0;
+		float maxGround = data[0].x;
+		for (int i = 1; i < count; i++)
+		{
+			if (data[i].x > maxGround)
+			{
+				maxGround = data[i].x;
+				k = i;
+			}
+		}
+		if (heightSum / count >= maxGround)
+		{
+			return float2(groundSum / count, heightSum / count);
+		}
+		else
+		{
+			// Shift data over:
+			count--;
+			groundSum -= data[k].x;
+			heightSum -= data[k].y;
+			for (int i = k; i < count; i++)
+			{
+				data[i] = data[i + 1];
+			}
+		}
+	}
+	// Count = 1...
+	return float2(groundSum / count, heightSum / count);*/
+
+
+
+	/*float depthSum = 0;
+	float groundSum = 0;
+	float heightSum = 0;
+	int count = 0;
+	float maxGround = 0;
+	for (uint x2 = max(0, x - 1); x2 <= x && x2 < Size; x2++)
+	{
+		for (uint z2 = max(0, z - 1); z2 <= z && z2 < Size; z2++)
+		{
+			heightSum += Height(Index(x2, z2));
+			count++;
+			if (Prev[Index(x2, z2)].x > maxGround)
+				maxGround = Prev[Index(x2, z2)].x;
+		}
+	}
+
+	if (heightSum / count >= maxGround)
+	{
+		return heightSum / count;
+	}
+	count = 0;
+
+	for (uint x2 = max(0, x - 1); x2 <= x && x2 < Size; x2++)
+	{
+		for (uint z2 = max(0, z - 1); z2 <= z && z2 < Size; z2++)
+		{
+			if (heightPlusDepth >= Prev[Index(x2, z2)].x)
+			{
+				depthSum += Prev[Index(x2, z2)].y;
+				groundSum += Prev[Index(x2, z2)].x;
+				count++;
+			}
+		}
+	}
+	return (depthSum + groundSum) / count;*/
+// }
+
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+	Vert verts[4];
+	for (uint x = 0; x < 2; x++)
+	{
+		for (uint z = 0; z < 2; z++)
+		{
+			float height = lerp(_WaterTablePrev[Index(id.xy)].height[x][z], _WaterTableNext[Index(id.xy)].height[x][z], _Interp);
+			verts[x * 2 + z].position = float4((id.x + x) * _Length, height, (id.y + z) * _Length, 1.0);
+
+			// Check if heights match; if they do, their normal should be exactly the same as well
+
+			float2 lerpedNormalXZ = lerp(_WaterTablePrev[Index(id.x + x, id.y + z)].normalXZ, _WaterTableNext[Index(id.x + x, id.y + z)].normalXZ, _Interp);
+
+			verts[x * 2 + z].normal = normalize(float3(lerpedNormalXZ.x, _Length, lerpedNormalXZ.y));
+		}
+	}
+	
+	// bool good[4];
+
+	/*float ground = Prev[Index(id.xy)].x;
+	// float heightPlusDepth = Height(Index(id.xy));
+	for (uint x = 0; x < 2; x++)
+	{
+		for (uint z = 0; z < 2; z++)
+		{
+			// good[x * 2 + z] = Prev[Index(id.x + x, id.y + z)].y >= 0.001f; // Needs to be above a reasonable number
+			float2 groundAndHeight = AverageHeight(id.x + x, id.y + z);
+			groundAndHeight.y = max(ground, groundAndHeight.y) - 0.2f;
+			verts[x * 2 + z].position = float4((id.x + x) * Length, groundAndHeight.y, (id.y + z) * Length, 1.0);
+			verts[x * 2 + z].normal = float3(0, 1, 0); // I guess a geometry shader would need something like this, but this doesn't?
+			verts[x * 2 + z].depth = groundAndHeight.y - groundAndHeight.x;
+		}
+	}*/
+
+	
+	/*if (Prev[Index(id)].y < 0.001f)
+	{
+		verts[0].position = float4(0, 0, 0, _NaN);
+		verts[1].position = float4(0, 0, 0, _NaN);
+		verts[2].position = float4(0, 0, 0, _NaN);
+		verts[3].position = float4(0, 0, 0, _NaN);
+	}*/
+
+
+	// Validate lines:
+	// If line intersects with 
+
+	/*uint2 minIndex;
+
+	float mid = (verts[0].position.y + verts[1].position.y) * 0.5f;
+	float maxGround = max(Prev[Index(id.x, id.y)].x, Prev[Index(id.x + 1, id.y)].x);
+	if (mid < maxGround)
+	{
+		// Become a waterfall.. or not
+		if (verts[0].position.y < verts[1].position.y)
+		verts[0].position.y = verts[1].position.y;
+
+	}*/
+
+
+
+
+	int index = (id.x * _Size + id.y) * 6;
+	_VertBuffer[index + 0] = verts[0];
+	_VertBuffer[index + 1] = verts[1];
+	_VertBuffer[index + 2] = verts[2];
+	_VertBuffer[index + 3] = verts[2];
+	_VertBuffer[index + 4] = verts[1];
+	_VertBuffer[index + 5] = verts[3];
+	/*Quad quad;
+	quad.a = verts[0];
+	quad.b = verts[1];
+	quad.c = verts[2];
+	quad.d = verts[2];
+	quad.e = verts[1];
+	quad.f = verts[3];
+	_VertBuffer.Append(quad);
+
+	_VertBuffer.Append(verts[0]);
+	_VertBuffer.Append(verts[1]);
+	_VertBuffer.Append(verts[2]);
+	_VertBuffer.Append(verts[2]);
+	_VertBuffer.Append(verts[1]);
+	_VertBuffer.Append(verts[3]);*/
+
+	if (id.x > 0 && id.y > 0)
+	{
+		// float2 vel = float2(Prev[Index(id.x - 1, id.y)].z + Prev[Index(id.xy)].z, Prev[Index(id.x, id.y - 1)].w + Prev[Index(id.xy)].w) / (Length * Prev[Index(id.xy)].y * 2);
+
+		float2 vel = lerp(
+			float2(_WaterTablePrev[Index(id.x - 1, id.y)].vel.x + _WaterTablePrev[Index(id.xy)].vel.x, _WaterTablePrev[Index(id.x, id.y - 1)].vel.y + _WaterTablePrev[Index(id.xy)].vel.y),
+			float2(_WaterTableNext[Index(id.x - 1, id.y)].vel.x + _WaterTableNext[Index(id.xy)].vel.x, _WaterTableNext[Index(id.x, id.y - 1)].vel.y + _WaterTableNext[Index(id.xy)].vel.y),
+			_Interp) * 0.5f;
+
+			// float2((VelocityX(uint2(id.x - 1, id.y)) + VelocityX(id.xy)) * 0.5f, (VelocityZ(uint2(id.x, id.y - 1)) + VelocityZ(id.xy)) * 0.5f);
+
+		// float magnitude = sqrt(vel.x * vel.x + vel.y * vel.y);
+
+		// if (vel.x == 0 && vel.y == 0)
+		//  vel = float2(1, 0);
+		// else
+		// 	vel /= magnitude;
+		
+		// vel = float2(1, 0);
+
+		/*float t = _Time % 10.0f;
+		if (t < 5)
+			magnitude = t * 20.f;
+		else
+			magnitude = (10 - t) * 20.f;*/
+
+		// Slowly change velocity magnitude:
+		// float2 oldVel = _FlowMap[Index(id.xy)].xy;
+		// float2 newVel = lerp(oldVel, (vel + 1) / 2.f, 0.001f);
+
+		// float oldMagnitude = _FlowMap[Index(id.xy)].z;
+		// float newMagnitude = lerp(oldMagnitude, magnitude / 256.0f, 0.001f); // based on framerate for now...
+
+		_FlowMap[Index(id.xy)] += vel * _DeltaTime;
+		// If the x or z value go over the texture height, then we should subtract the x or z value by the texture height, to maintain float precision forever
+	}
+}
